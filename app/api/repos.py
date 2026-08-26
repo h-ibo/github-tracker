@@ -4,6 +4,8 @@ from typing import List
 import asyncio
 import httpx
 import time
+from datetime import datetime
+from app.models.models import RepoEvent
 
 from app.core.database import get_session
 from app.models.models import TrackedRepo
@@ -79,4 +81,72 @@ async def test_async_github():
         "message": "Async istekler (Semaphore korumalı) tamamlandı!",
         "gecen_sure_saniye": round(end_time - start_time, 2),
         "cekilen_repo_sayisi": len(results)
+    }
+# 5. Yeni Commit'leri Kontrol Etme ve Veritabanına Kaydetme
+@router.post("/check-updates")
+async def check_updates_manually(session: Session = Depends(get_session)):
+    # Sistemdeki tüm takip edilen repoları al
+    repos = session.exec(select(TrackedRepo)).all()
+    if not repos:
+        return {"message": "Takip edilen hiçbir repo yok."}
+        
+    sem = asyncio.Semaphore(5)
+    
+    # Sadece GitHub'dan veriyi çekip döndüren yardımcı fonksiyon
+    async def fetch_latest_data(repo, client):
+        async with sem:
+            try:
+                commits = await fetch_repo_commits_async(repo.owner, repo.repo_name, client)
+                if commits:
+                    return {
+                        "repo_id": repo.id,
+                        "sha": commits[0]["sha"],
+                        "message": commits[0]["commit"]["message"],
+                        "url": commits[0]["html_url"]
+                    }
+            except Exception as e:
+                print(f"Hata ({repo.repo_name}): {e}")
+            return None
+
+    # 1. Aşama: Tüm GitHub isteklerini paralel atıp verileri topla
+    async with httpx.AsyncClient() as client:
+        tasks = [fetch_latest_data(r, client) for r in repos]
+        results = await asyncio.gather(*tasks)
+        
+    # 2. Aşama: Veritabanı karşılaştırma ve kaydetme işlemleri
+    new_events_count = 0
+    for data in results:
+        if not data:
+            continue
+            
+        # İlgili repoyu veritabanından al
+        repo = session.get(TrackedRepo, data["repo_id"])
+        
+        # Değişiklik var mı? (İlk eklemede last_known_commit_sha None'dur, bu da farklı sayılır)
+        if repo.last_known_commit_sha != data["sha"]:
+            
+            # Yeni olayı (Event) oluştur
+            new_event = RepoEvent(
+                tracked_repo_id=repo.id,
+                event_type="new_commit",
+                title=data["message"][:100],  # Başlık çok uzun olmasın diye kesiyoruz
+                url=data["url"]
+            )
+            session.add(new_event)
+            
+            # Reponun güncel SHA bilgisini güncelle
+            repo.last_known_commit_sha = data["sha"]
+            repo.last_checked_at = datetime.utcnow()
+            session.add(repo)
+            
+            new_events_count += 1
+            
+    # Eğer yeni olay(lar) bulunduysa değişiklikleri veritabanına işle (commit)
+    if new_events_count > 0:
+        session.commit()
+        
+    return {
+        "message": "Kontrol tamamlandı.",
+        "taranan_repo_sayisi": len(repos),
+        "bulunan_yeni_olay_sayisi": new_events_count
     }
