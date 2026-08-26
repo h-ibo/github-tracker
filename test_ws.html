@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>GitHub Repo - Canlı Bildirim Testi</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f9; }
+        #messages { background: white; border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: scroll; list-style-type: none; }
+        #messages li { padding: 8px; border-bottom: 1px solid #eee; }
+        .new-alert { color: #d9534f; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>🚀 Canlı Repo Bildirimleri</h2>
+    <ul id="messages"></ul>
+
+    <script>
+        // FastAPI sunucumuza WebSocket üzerinden bağlanıyoruz
+        var ws = new WebSocket("ws://localhost:8000/ws/repo-alerts");
+        var messagesList = document.getElementById("messages");
+
+        // Bağlantı başarılı olduğunda çalışır
+        ws.onopen = function() {
+            var li = document.createElement("li");
+            li.style.color = "green";
+            li.innerText = "🟢 Sunucuya başarıyla bağlanıldı. Bildirimler bekleniyor...";
+            messagesList.appendChild(li);
+        };
+
+        // Sunucudan (FastAPI) yeni bir mesaj geldiğinde çalışır
+        ws.onmessage = function(event) {
+            var data = JSON.parse(event.data);
+            var li = document.createElement("li");
+            li.innerHTML = "<span class='new-alert'>[YENİ OLAY]</span> <b>" + data.repo_name + "</b>: " + data.title;
+            messagesList.appendChild(li);
+        };
+
+        ws.onclose = function() {
+            var li = document.createElement("li");
+            li.style.color = "red";
+            li.innerText = "🔴 Sunucu bağlantısı koptu.";
+            messagesList.appendChild(li);
+        };
+    </script>
+</body>
+</html>

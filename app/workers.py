@@ -53,6 +53,25 @@ async def async_check_repos():
                 repo.last_checked_at = datetime.utcnow()
                 session.add(repo)
                 new_events_count += 1
+                repo.last_checked_at = datetime.utcnow()
+                session.add(repo)
+                new_events_count += 1
+                print(f"[!] YENİ GÜNCELLEME: {repo.repo_name} için yeni commit yakalandı!")
+
+                try:
+                    async with httpx.AsyncClient() as push_client:
+                        await push_client.post(
+                            "http://api:8000/ws/trigger-alert",
+                            json={
+                                "repo_name": f"{repo.owner}/{repo.repo_name}", 
+                                "title": data["message"][:100]
+                            }
+                        )
+                except Exception as e:
+                    print(f"WebSocket tetikleme hatası: {e}")
+               
+
+        if new_events_count > 0:
                 print(f"[!] YENİ GÜNCELLEME: {repo.repo_name} için yeni commit yakalandı!")
 
         if new_events_count > 0:
