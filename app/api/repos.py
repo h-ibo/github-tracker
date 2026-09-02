@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select
+from sqlmodel import Session, select, desc
 from typing import List
 import asyncio
 import httpx
@@ -11,25 +11,28 @@ from app.core.database import get_session
 from app.models.models import TrackedRepo
 # Sadece yeni asenkron fonksiyonumuzu import ediyoruz
 from app.core.github import fetch_repo_commits_async
+from app.core.websockets import manager
 
 router = APIRouter(prefix="/repos", tags=["Repos"])
+
 
 # 1. Yeni Repo Ekleme
 @router.post("/track", response_model=TrackedRepo)
 def track_repo(repo: TrackedRepo, session: Session = Depends(get_session)):
     statement = select(TrackedRepo).where(
-        TrackedRepo.owner == repo.owner, 
+        TrackedRepo.owner == repo.owner,
         TrackedRepo.repo_name == repo.repo_name
     )
     existing_repo = session.exec(statement).first()
-    
+
     if existing_repo:
         raise HTTPException(status_code=400, detail="Bu repo zaten takip ediliyor.")
-    
+
     session.add(repo)
     session.commit()
     session.refresh(repo)
     return repo
+
 
 # 2. Takip Edilen Tüm Repoları Listeleme
 @router.get("/track", response_model=List[TrackedRepo])
@@ -37,16 +40,18 @@ def get_tracked_repos(session: Session = Depends(get_session)):
     repos = session.exec(select(TrackedRepo)).all()
     return repos
 
+
 # 3. Repo Takibini Bırakma (Silme)
 @router.delete("/track/{repo_id}")
 def untrack_repo(repo_id: int, session: Session = Depends(get_session)):
     repo = session.get(TrackedRepo, repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repo bulunamadı.")
-    
+
     session.delete(repo)
     session.commit()
     return {"message": f"'{repo.repo_name}' isimli repo takipten çıkarıldı."}
+
 
 @router.get("/test-async")
 async def test_async_github():
@@ -57,41 +62,43 @@ async def test_async_github():
         ("encode", "starlette"),
         ("pydantic", "pydantic")
     ]
-    
+
     # EŞZAMANLI İSTEK SINIRI: Aynı anda en fazla 2 isteğe izin ver
     sem = asyncio.Semaphore(2)
-    
+
     # Semaphore'u kullanan sarmalayıcı (wrapper) fonksiyon
     async def fetch_with_semaphore(owner, repo, client):
         async with sem:
             return await fetch_repo_commits_async(owner, repo, client)
-            
+
     start_time = time.time()
-    
+
     async with httpx.AsyncClient() as client:
         tasks = [
-            fetch_with_semaphore(owner, repo, client) 
+            fetch_with_semaphore(owner, repo, client)
             for owner, repo in test_repos
         ]
         results = await asyncio.gather(*tasks)
-        
+
     end_time = time.time()
-    
+
     return {
         "message": "Async istekler (Semaphore korumalı) tamamlandı!",
         "gecen_sure_saniye": round(end_time - start_time, 2),
         "cekilen_repo_sayisi": len(results)
     }
-# 5. Yeni Commit'leri Kontrol Etme ve Veritabanına Kaydetme
+
+
+# 4. Yeni Commit'leri Kontrol Etme ve Veritabanına Kaydetme (manuel tetikleme)
 @router.post("/check-updates")
 async def check_updates_manually(session: Session = Depends(get_session)):
     # Sistemdeki tüm takip edilen repoları al
     repos = session.exec(select(TrackedRepo)).all()
     if not repos:
         return {"message": "Takip edilen hiçbir repo yok."}
-        
+
     sem = asyncio.Semaphore(5)
-    
+
     # Sadece GitHub'dan veriyi çekip döndüren yardımcı fonksiyon
     async def fetch_latest_data(repo, client):
         async with sem:
@@ -112,19 +119,19 @@ async def check_updates_manually(session: Session = Depends(get_session)):
     async with httpx.AsyncClient() as client:
         tasks = [fetch_latest_data(r, client) for r in repos]
         results = await asyncio.gather(*tasks)
-        
+
     # 2. Aşama: Veritabanı karşılaştırma ve kaydetme işlemleri
     new_events_count = 0
     for data in results:
         if not data:
             continue
-            
+
         # İlgili repoyu veritabanından al
         repo = session.get(TrackedRepo, data["repo_id"])
-        
+
         # Değişiklik var mı? (İlk eklemede last_known_commit_sha None'dur, bu da farklı sayılır)
         if repo.last_known_commit_sha != data["sha"]:
-            
+
             # Yeni olayı (Event) oluştur
             new_event = RepoEvent(
                 tracked_repo_id=repo.id,
@@ -133,20 +140,91 @@ async def check_updates_manually(session: Session = Depends(get_session)):
                 url=data["url"]
             )
             session.add(new_event)
-            
+
             # Reponun güncel SHA bilgisini güncelle
             repo.last_known_commit_sha = data["sha"]
             repo.last_checked_at = datetime.utcnow()
             session.add(repo)
-            
+
             new_events_count += 1
+
+            # --- DİNAMİK BİLDİRİM KISMI ---
+            # GitHub commit mesajlarını ilk alt satırdan (\n) bölüp sadece başlığını alıyoruz
+            # ve telefon ekranına sığması için 50 karakterle sınırlandırıyoruz.
+            clean_message = data["message"].split('\n')[0][:50]
             
+            try:
+                await manager.broadcast({
+                    "repo_name": f"{repo.owner}/{repo.repo_name}",
+                    "title": f"Yeni: {clean_message}..."
+                })
+            except Exception as e:
+                print(f"WebSocket tetikleme hatası: {e}")
+
     # Eğer yeni olay(lar) bulunduysa değişiklikleri veritabanına işle (commit)
     if new_events_count > 0:
         session.commit()
-        
+
     return {
         "message": "Kontrol tamamlandı.",
         "taranan_repo_sayisi": len(repos),
         "bulunan_yeni_olay_sayisi": new_events_count
     }
+@router.get("/events", response_model=List[RepoEvent])
+def get_all_events(session: Session = Depends(get_session)):
+    statement = select(RepoEvent).order_by(desc(RepoEvent.detected_at))
+    return session.exec(statement).all()
+
+
+# 6. Sadece belirli bir reponun olaylarını listele
+@router.get("/{repo_id}/events", response_model=List[RepoEvent])
+def get_repo_events(repo_id: int, session: Session = Depends(get_session)):
+    repo = session.get(TrackedRepo, repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo bulunamadı.")
+
+    statement = (
+        select(RepoEvent)
+        .where(RepoEvent.tracked_repo_id == repo_id)
+        .order_by(desc(RepoEvent.detected_at))
+    )
+    return session.exec(statement).all()
+
+
+# 7. Okunmamış event sayısını getir (repo listesinde badge göstermek için pratik)
+@router.get("/events/unread-count")
+def get_unread_events_count(session: Session = Depends(get_session)):
+    statement = select(RepoEvent).where(RepoEvent.is_read == False)  # noqa: E712
+    unread = session.exec(statement).all()
+    return {"unread_count": len(unread)}
+
+
+# 8. Bir olayı okundu olarak işaretle
+@router.post("/events/{event_id}/read")
+def mark_event_read(event_id: int, session: Session = Depends(get_session)):
+    event = session.get(RepoEvent, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event bulunamadı.")
+
+    event.is_read = True
+    session.add(event)
+    session.commit()
+    return {"message": "Okundu olarak işaretlendi."}
+
+
+# 9. Bir repoya ait tüm olayları okundu olarak işaretle
+# (Kullanıcı repo detayına girip listeyi gördüğünde çağırmak için kullanışlı)
+@router.post("/{repo_id}/events/mark-all-read")
+def mark_all_events_read(repo_id: int, session: Session = Depends(get_session)):
+    statement = select(RepoEvent).where(
+        RepoEvent.tracked_repo_id == repo_id,
+        RepoEvent.is_read == False  # noqa: E712
+    )
+    events = session.exec(statement).all()
+
+    for event in events:
+        event.is_read = True
+        session.add(event)
+
+    session.commit()
+    return {"message": f"{len(events)} olay okundu olarak işaretlendi."}

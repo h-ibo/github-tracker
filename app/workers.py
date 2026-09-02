@@ -8,6 +8,7 @@ from app.core.database import engine
 from app.models.models import TrackedRepo, RepoEvent
 from app.core.github import fetch_repo_commits_async
 
+
 async def async_check_repos():
     with Session(engine) as session:
         repos = session.exec(select(TrackedRepo)).all()
@@ -16,7 +17,7 @@ async def async_check_repos():
             return
 
         sem = asyncio.Semaphore(5)
-        
+
         async def fetch_latest_data(repo, client):
             async with sem:
                 try:
@@ -38,8 +39,9 @@ async def async_check_repos():
 
         new_events_count = 0
         for data in results:
-            if not data: continue
-            
+            if not data:
+                continue
+
             repo = session.get(TrackedRepo, data["repo_id"])
             if repo.last_known_commit_sha != data["sha"]:
                 new_event = RepoEvent(
@@ -49,12 +51,11 @@ async def async_check_repos():
                     url=data["url"]
                 )
                 session.add(new_event)
+
                 repo.last_known_commit_sha = data["sha"]
                 repo.last_checked_at = datetime.utcnow()
                 session.add(repo)
-                new_events_count += 1
-                repo.last_checked_at = datetime.utcnow()
-                session.add(repo)
+
                 new_events_count += 1
                 print(f"[!] YENİ GÜNCELLEME: {repo.repo_name} için yeni commit yakalandı!")
 
@@ -63,21 +64,18 @@ async def async_check_repos():
                         await push_client.post(
                             "http://api:8000/ws/trigger-alert",
                             json={
-                                "repo_name": f"{repo.owner}/{repo.repo_name}", 
+                                "repo_name": f"{repo.owner}/{repo.repo_name}",
                                 "title": data["message"][:100]
                             }
                         )
                 except Exception as e:
                     print(f"WebSocket tetikleme hatası: {e}")
-               
-
-        if new_events_count > 0:
-                print(f"[!] YENİ GÜNCELLEME: {repo.repo_name} için yeni commit yakalandı!")
 
         if new_events_count > 0:
             session.commit()
-            
+
         print(f"[*] Arka plan taraması bitti. {new_events_count} yeni olay bulundu.")
+
 
 @celery_app.task
 def check_all_repos():
