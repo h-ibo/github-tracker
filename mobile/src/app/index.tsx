@@ -98,7 +98,7 @@ export default function App() {
       await axios.post(`${API_URL}/track`, {
         owner: owner.toLowerCase().trim(),
         repo_name: repoName.toLowerCase().trim(),
-        added_by_user: "Halil"
+        added_by_user: "Admin"
       });
       
       setModalVisible(false);
